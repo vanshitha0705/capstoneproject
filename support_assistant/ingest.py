@@ -1,94 +1,80 @@
-﻿"""
-ingest.py -- Module 3: chunking, embedding, and storing the Zepto policy
-corpus in ChromaDB.
+"""
+Ingestion pipeline for the Zepto support-assistant corpus.
 
-Each of the 8 corpus documents (docs/doc_01.txt ... docs/doc_08.txt) is
-short enough to serve as its own single chunk -- a simple per-document
-chunking scheme, which the assignment spec explicitly allows given their
-length. Each chunk is embedded locally with sentence-transformers'
-all-MiniLM-L6-v2 model (no API key, no network call beyond the one-time
-model download) and stored in a persistent ChromaDB collection on disk, so
-the FastAPI app can query it without re-running ingestion on every startup.
+Stage: ingestion -> embedding -> storage
+  1. Load the 8 .txt documents from docs/.
+  2. Chunk them (each document is short enough that we use a simple
+     per-document chunk; one chunk == one document == one policy topic).
+  3. Embed each chunk locally with sentence-transformers/all-MiniLM-L6-v2
+     (no API key, no network call required at inference time once the
+     model has been downloaded once).
+  4. Store the embeddings + text + metadata in a persistent ChromaDB
+     collection ("zepto_policies") on disk under ./chroma_db.
 
-Run:
+Run this once before starting the API:
     python ingest.py
 """
 
-from pathlib import Path
+import os
+import glob
 
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-DOCS_DIR = Path(__file__).parent / "docs"
-CHROMA_DIR = Path(__file__).parent / "chroma_db"
+DOCS_DIR = os.path.join(os.path.dirname(__file__), "docs")
+CHROMA_DIR = os.path.join(os.path.dirname(__file__), "chroma_db")
 COLLECTION_NAME = "zepto_policies"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 
 def load_documents() -> list[dict]:
-    """
-    Load each doc_0N.txt file as a single chunk. Returns a list of dicts:
-    {"id": "doc_01", "text": "...", "source": "doc_01.txt"}
-    """
+    """Load each doc_XX.txt file as one chunk, keyed by its filename stem."""
     chunks = []
-    for path in sorted(DOCS_DIR.glob("doc_*.txt")):
-        doc_id = path.stem  # e.g. "doc_01"
-        text = path.read_text(encoding="utf-8").strip()
-        chunks.append({"id": doc_id, "text": text, "source": path.name})
+    paths = sorted(glob.glob(os.path.join(DOCS_DIR, "doc_*.txt")))
+    if not paths:
+        raise FileNotFoundError(f"No corpus documents found in {DOCS_DIR}")
+    for path in paths:
+        doc_id = os.path.splitext(os.path.basename(path))[0]  # e.g. "doc_01"
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        chunks.append({"id": doc_id, "text": text})
     return chunks
 
 
-def main():
-    print(f"Loading documents from {DOCS_DIR} ...")
+def build_index() -> None:
     chunks = load_documents()
-    print(f"Loaded {len(chunks)} document(s):")
-    for c in chunks:
-        print(f"  {c['id']} ({len(c['text'])} chars)")
+    print(f"Loaded {len(chunks)} corpus documents from {DOCS_DIR}")
 
-    if len(chunks) != 8:
-        print(
-            f"WARNING: expected exactly 8 documents, found {len(chunks)}. "
-            f"Check that docs/doc_01.txt ... doc_08.txt all exist."
-        )
-
-    print(f"\nLoading embedding model ''{EMBEDDING_MODEL_NAME}'' (local, no API key)...")
+    print(f"Loading embedding model '{EMBEDDING_MODEL_NAME}' (sentence-transformers)...")
     model = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
-    print("Embedding all chunks...")
     texts = [c["text"] for c in chunks]
+    ids = [c["id"] for c in chunks]
+
+    print("Embedding chunks...")
     embeddings = model.encode(texts, show_progress_bar=False).tolist()
 
-    print(f"\nInitializing persistent ChromaDB at {CHROMA_DIR} ...")
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    print(f"Writing to persistent ChromaDB collection '{COLLECTION_NAME}' at {CHROMA_DIR}...")
+    client = chromadb.PersistentClient(path=CHROMA_DIR)
 
-    # Start fresh each run so ingestion is idempotent/re-runnable
+    # Fresh collection each run so re-ingesting is idempotent.
     try:
         client.delete_collection(COLLECTION_NAME)
     except Exception:
-        pass  # collection didn't exist yet -- fine
+        pass
     collection = client.create_collection(COLLECTION_NAME)
 
     collection.add(
-        ids=[c["id"] for c in chunks],
+        ids=ids,
         embeddings=embeddings,
-        documents=[c["text"] for c in chunks],
-        metadatas=[{"source": c["source"]} for c in chunks],
+        documents=texts,
+        metadatas=[{"doc_id": doc_id} for doc_id in ids],
     )
 
-    print(f"Stored {collection.count()} chunk(s) in collection ''{COLLECTION_NAME}''.")
-
-    # Quick sanity check: query with one of the corpus texts itself and
-    # confirm the top result is that same document.
-    print("\nSanity check query: ''How long do I have to return a damaged item?''")
-    query_embedding = model.encode(["How long do I have to return a damaged item?"]).tolist()
-    results = collection.query(query_embeddings=query_embedding, n_results=3)
-    for doc_id, distance, doc_text in zip(
-        results["ids"][0], results["distances"][0], results["documents"][0]
-    ):
-        print(f"  {doc_id} (distance={distance:.4f}): {doc_text[:80]}...")
-
-    print("\nIngestion complete.")
+    count = collection.count()
+    print(f"Stored {count} document embeddings in ChromaDB collection '{COLLECTION_NAME}'.")
+    assert count == 8, f"Expected 8 corpus docs stored, found {count}"
 
 
 if __name__ == "__main__":
-    main()
+    build_index()
